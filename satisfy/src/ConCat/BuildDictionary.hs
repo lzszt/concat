@@ -31,8 +31,6 @@ module ConCat.BuildDictionary
 
 import Data.Monoid (Any(..))
 import Data.Char (isSpace)
-import Data.Data (Data)
-import Data.Generics (mkQ,everything)
 import Control.Monad (filterM,when)
 
 import GhcPlugins
@@ -48,6 +46,7 @@ import TcInteract (solveSimpleGivens)
 import TcSMonad -- (TcS,runTcS)
 import TcEvidence (evBindMapBinds)
 import TcErrors(warnAllUnsolved)
+import qualified TcMType as TcMType
 
 import DsMonad
 import DsBinds
@@ -131,22 +130,16 @@ runDsM :: HscEnv -> DynFlags -> ModGuts -> DsM a -> IO a
 runDsM env dflags guts = runTcM env dflags guts . initDsTc
 
 -- | Build a dictionary for the given id
-buildDictionary' :: HscEnv -> DynFlags -> ModGuts -> VarSet -> Id
+buildDictionary' :: HscEnv -> DynFlags -> ModGuts -> VarSet -> Type
                  -> IO (Maybe (Id, [CoreBind]))
-buildDictionary' env dflags guts evIds evar =
+buildDictionary' env dflags guts evIds predTy =
   do res <-
        runTcM env dflags guts $
        do loc <- getCtLocM (GivenOrigin UnkSkol) Nothing
-          let givens = mkGivens loc (uniqSetToList evIds)
-              predTy = varType evar
-              nonC = mkNonCanonical $
-                       CtWanted { ctev_pred = predTy
-                                , ctev_dest = EvVarDest evar
-#if MIN_VERSION_GLASGOW_HASKELL(8,2,0,0)
-                                , ctev_nosh = WOnly
-#endif
-                                , ctev_loc = loc }
-              wCs = mkSimpleWC [cc_ev nonC]
+          evidence <- TcMType.newWanted (GivenOrigin UnkSkol) Nothing predTy
+          let EvVarDest evarDest = ctev_dest evidence
+              givens = mkGivens loc (uniqSetToList evIds)
+              wCs = mkSimpleWC [evidence]
           -- TODO: Make sure solveWanteds is the right function to call.
           traceTc' "buildDictionary': givens" (ppr givens)
           (wantedConstraints, bnds0) <-
@@ -170,7 +163,7 @@ buildDictionary' env dflags guts evIds evar =
           -- warnAllUnsolved _wCs'
           traceTc' "buildDictionary' zonked" (ppr bnds)
           if isEmptyWC wantedConstraints
-          then return (Just (evar, bnds))
+          then return (Just (evarDest, bnds))
           else return Nothing
      case res of
        Just (i, bs) ->
@@ -178,36 +171,27 @@ buildDictionary' env dflags guts evIds evar =
             return (Just (i, bs'))
        Nothing -> return Nothing
 
--- TODO: Richard Eisenberg: "use TcMType.newWanted to make your CtWanted. As it
--- stands, if predTy is an equality constraint, your CtWanted will be
--- ill-formed, as all equality constraints should have HoleDests, not
--- EvVarDests. Using TcMType.newWanted will simplify and improve your code."
-
--- TODO: Why return the given evar?
 
 -- TODO: Try to combine the two runTcM calls.
 
-buildDictionary :: HscEnv -> DynFlags -> ModGuts -> InScopeEnv -> Type -> CoreExpr -> Type -> IO (Either SDoc CoreExpr)
-buildDictionary env dflags guts inScope evType@(TyConApp tyCon evTypes) ev goalTy | isTupleTyCon tyCon =
-  reallyBuildDictionary env dflags guts inScope evType evTypes ev goalTy
+buildDictionary :: HscEnv -> DynFlags -> ModGuts -> UniqSupply -> InScopeEnv -> Type -> CoreExpr -> Type -> IO (Either SDoc CoreExpr)
+buildDictionary env dflags guts uniqSupply inScope evType@(TyConApp tyCon evTypes) ev goalTy | isTupleTyCon tyCon =
+  reallyBuildDictionary env dflags guts uniqSupply inScope evType evTypes ev goalTy
 -- only 1-tuples in Haskell  
-buildDictionary env dflags guts inScope evType ev goalTy | isEvVarType evType =
-  reallyBuildDictionary env dflags guts inScope evType [evType] ev goalTy
-buildDictionary _env _dflags _guts _inScope evT _ev _goalTy = pprPanic "evidence type mismatch" (ppr evT)
+buildDictionary env dflags guts uniqSupply inScope evType ev goalTy | isEvVarType evType =
+  reallyBuildDictionary env dflags guts uniqSupply inScope evType [evType] ev goalTy
+buildDictionary _env _dflags _guts _uniqSupply _inScope evT _ev _goalTy = pprPanic "evidence type mismatch" (ppr evT)
                                                          
-reallyBuildDictionary :: HscEnv -> DynFlags -> ModGuts -> InScopeEnv -> Type -> [Type] -> CoreExpr -> Type -> IO (Either SDoc CoreExpr)
-reallyBuildDictionary env dflags guts inScope evType evTypes ev goalTy =
+reallyBuildDictionary :: HscEnv -> DynFlags -> ModGuts -> UniqSupply -> InScopeEnv -> Type -> [Type] -> CoreExpr -> Type -> IO (Either SDoc CoreExpr)
+reallyBuildDictionary env dflags guts uniqSupply _inScope evType evTypes ev goalTy =
   pprTrace' "\nbuildDictionary" (ppr goalTy) $
   pprTrace' "buildDictionary in-scope evidence" (ppr ev) $
-  reassemble <$> buildDictionary' env dflags guts evIdSet binder
+  reassemble <$> buildDictionary' env dflags guts evIdSet goalTy
  where
    evIds = [ local
-           | (evTy, index) <- evTypes `zip` [(0 :: Int) ..]
-           , let local = localId inScope ("evidence" ++ show index) evTy ]
+           | (evTy, unq) <- evTypes `zip` (uniqsFromSupply uniqSupply)
+           , let local = mkLocalId (mkSystemVarName unq evVarName) evTy ]
    evIdSet = mkVarSet evIds
-   binder = localId inScope name goalTy
-   name = "$d" ++ zEncodeString (filter (not . isSpace) (showPpr dflags goalTy))
-   goalTyVars = tyCoVarsOfType goalTy
    reassemble Nothing =
      Left (text "unsolved constraints")
    reassemble (Just (i,bnds)) =
@@ -218,7 +202,6 @@ reallyBuildDictionary env dflags guts inScope evType evTypes ev goalTy =
      res
     where
       res | null bnds          = Left (text "no bindings")
-          | notNull holeyBinds = Left (text "coercion holes: " <+> ppr holeyBinds)
           | otherwise          = return $ simplifyE dflags False
                                           expr
       dict =
@@ -229,27 +212,12 @@ reallyBuildDictionary env dflags guts inScope evType evTypes ev goalTy =
       -- could optimize if these things are already variables
       expr = if null evTypes
              then dict
-             else mkWildCase ev evType goalTy [(DataAlt (tupleDataCon Boxed (length evIds)), evIds, dict)]
-      holeyBinds = filter hasCoercionHole bnds
+             else case evIds of
+                    [evId] -> mkCoreLet (NonRec evId ev) dict
+                    _ -> mkWildCase ev evType goalTy [(DataAlt (tupleDataCon Boxed (length evIds)), evIds, dict)]
 
-hasCoercionHole :: Data t => t -> Bool
-hasCoercionHole = getAny . everything mappend (mkQ mempty (Any . isHole))
- where
-   isHole :: CoercionHole -> Bool
-   isHole = const True
-
--- | Make a unique identifier for a specified type, using a provided name.
-localId :: InScopeEnv -> String -> Type -> Id
-localId (inScopeSet,_) str ty =
-  uniqAway inScopeSet (mkLocalId (stringToName str) ty)
-
-stringToName :: String -> Name
-stringToName str =
-  mkSystemVarName (mkUniqueGrimily (abs (fromIntegral (hashString str))))
-                  (mkFastString str)
-
--- When mkUniqueGrimily's argument is negative, we see something like
--- "Exception: Prelude.chr: bad argument: (-52)". Hence the abs.
+evVarName :: FastString
+evVarName = mkFastString "evidence"
 
 -- Transform calls to a function that requires a dictionary into one
 -- another one that also takes a tuple of available locally-bound

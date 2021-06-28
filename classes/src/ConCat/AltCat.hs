@@ -63,6 +63,7 @@ import qualified ConCat.MinMax as ConCatMinMax
 import Data.Key (Zip(..))
 import Data.Distributive (Distributive(..))
 import Data.Functor.Rep (Representable(..),distributeRep)
+import Data.Kind (Type)
 -- import qualified Data.Functor.Rep as R
 import Control.Newtype.Generics (Newtype(..))
 -- import Debug.Trace
@@ -885,6 +886,17 @@ zipWithC f = curry (fmapC (uncurry f) . zipC)
 {-# INLINE zipWithC #-}
 
 -- zipWithC f as bs = fmapC (uncurry f) (zipC (as,bs))
+
+-- asymmetic version of zipWithC
+zipWithC' :: forall k h a b c . (Ok3 k a b c, IxMonoidalPCat k h, Functor h) => (a -> b `k` c) -> h a -> (h b `k` h c)
+zipWithC' f xs = crossF (fmapNoCat @k f xs)
+{-# INLINE zipWithC' #-}
+
+-- hack to keep plugin from generalizing
+-- BUT: now there's no k argument anymore, so recatify just bails on it
+fmapNoCat :: forall (k :: Type -> Type -> Type) f a b . Functor f => (a -> b) -> f a -> f b
+fmapNoCat f xs = fmap f xs
+{-# NOINLINE fmapNoCat #-}
 
 Catify(zipWith, zipWithC)
 

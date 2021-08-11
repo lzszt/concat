@@ -45,7 +45,7 @@ AbsTyImports
 
 infixr 1 -+>
 -- | Additive homomorphisms
-data a -+> b = AddFun (a -> b)
+newtype a -+> b = AddFun (a -> b)
 
 -- newtype
 
